@@ -3,14 +3,15 @@
 BWTV Liga 2026 — Recap Video Build
 ==================================
 
-Baut das 5s-Recap-Video (1080x1920, h264) aus den Team-Logos dieses Repos.
+Baut das 7s-Recap-Video (1080x1920, h264) aus den Team-Logos dieses Repos.
 
 Szene (eine durchgehende Szene, weisser Hintergrund):
   0.0-0.5s  BWTV-Liga-Logo (Kontrast-Variante Black) zentriert, bereits sichtbar
   0.5-1.0s  Team-Logos poppen simultan/minimal gestaffelt rein
             (Scatter-Layout, elastic-out Scale 0 -> 1.1 -> 1.0)
   1.0-1.5s  "WIR SEHEN UNS 2027" Pop-In (Scale + Fade)
-  1.5-5.0s  Standbild / Hold
+  1.5-7.0s  Ausklang -- die Team-Logos schweben in mehreren
+            Tiefenebenen weiter wie Wolken, BWTV steht deckend davor
 
 Pipeline:  Layout (Python) -> recap.html -> Playwright-Frames -> ffmpeg (h264)
 
@@ -40,7 +41,7 @@ FRAMES = os.path.join(BUILD, "frames")
 
 W, H = 1080, 1920
 FPS = 30
-DURATION = 5.0
+DURATION = 7.0
 N_FRAMES = int(round(DURATION * FPS))
 
 SEED = 20261  # fester Seed -> reproduzierbares Scatter-Layout
@@ -52,6 +53,24 @@ T_LOGOS_DUR = 0.46     # Dauer einer einzelnen Elastic-Pop-Animation
 T_TEXT_START = 1.00
 T_TEXT_DUR = 0.42
 
+# ------------------------------------------------------------ Tiefenstaffelung
+#
+# Jedes Team-Logo bekommt eine Tiefe d zwischen 0 (weit hinten) und 1 (vorne).
+# Deckkraft, Groesse, Unschaerfe und Drift-Amplitude haengen daran -- dadurch
+# wirken die Logos wie Wolken in unterschiedlichen Entfernungen, waehrend das
+# BWTV-Logo deckend davor steht.
+DEPTH_OPACITY = (0.13, 0.78)   # hinten -> vorne
+DEPTH_SCALE = (0.72, 1.16)
+DEPTH_BLUR = (0.95, 0.0)       # px, hinten unschaerfer
+DEPTH_DRIFT = (0.45, 1.0)      # Parallaxe: vorne bewegt sich mehr
+DEPTH_NEAR = 0.30              # ab hier gilt ein Logo nicht mehr als "weit weg"
+
+# Sanftes Schweben (Sekunden bzw. px/Grad, vor Tiefen-Skalierung)
+DRIFT_PERIOD = (6.0, 13.0)
+DRIFT_X = (6.0, 13.0)
+DRIFT_Y = (5.0, 9.5)
+DRIFT_ROT = (0.6, 2.2)
+
 # BWTV-Liga-Logo (Kontrast-Variante fuer weissen Hintergrund)
 BWTV_LOGO = "Logo BWTV Liga Black.svg"
 BWTV_W = 600           # Renderbreite in px
@@ -60,25 +79,38 @@ BWTV_CX, BWTV_CY = 540, 780
 # Text-Block
 TEXT_CY = 1180
 
-# Team-Logos: Maximalgroesse und Mindestabstand zum Bildrand
+# Team-Logos: Maximalgroesse und Mindestabstand zum Bildrand.
+# GAP ist so gewaehlt, dass auch zwei maximal gegeneinander driftende Nachbarn
+# (je DRIFT_X[1] px) einander nicht beruehren.
 MAX_LOGO_W, MAX_LOGO_H = 172, 126
 EDGE = 26
+GAP = 2 * DRIFT_X[1] + 8
 
 # Team-Logos, die zusaetzlich zur team-logos.json aufgenommen werden sollen.
 # (Auf der Platte liegt "TNB Malterdingen white.svg", das in der team-logos.json
 #  fehlt. Bewusst leer gelassen -- die JSON ist laut Briefing die Quelle.)
 EXTRA_LOGOS: list[str] = []
 
-# Reservierte Zonen (x0, y0, x1, y1) -- hier duerfen keine Team-Logos liegen.
-def reserved_zones() -> list[tuple[float, float, float, float]]:
+# Reservierte Zonen (x0, y0, x1, y1) fuer BWTV-Logo und Outro-Text.
+# pad = 0 sind die reinen Bounding-Boxen: so nah duerfen die hintersten,
+# fast durchsichtigen Logos heran. Die vorderen Ebenen halten mehr Abstand.
+def reserved_zones(pad: float) -> list[tuple[float, float, float, float]]:
     bh = BWTV_W / bwtv_aspect()
-    return [
-        # BWTV-Logo + Luft
-        (BWTV_CX - BWTV_W / 2 - 55, BWTV_CY - bh / 2 - 55,
-         BWTV_CX + BWTV_W / 2 + 55, BWTV_CY + bh / 2 + 55),
-        # "WIR SEHEN UNS 2027" + Luft
-        (145, TEXT_CY - 148, 935, TEXT_CY + 148),
-    ]
+    logo = (BWTV_CX - BWTV_W / 2 - pad, BWTV_CY - bh / 2 - pad,
+            BWTV_CX + BWTV_W / 2 + pad, BWTV_CY + bh / 2 + pad)
+    text = (170 - pad, TEXT_CY - 136 - pad, 910 + pad, TEXT_CY + 136 + pad)
+
+    # Bleibt zwischen Logo und Text nur ein schmaler Korridor, wird er
+    # mitreserviert. Sonst rutschen dort Logos hinein, fuer die er zu eng ist,
+    # und die Relaxation bekommt sie nicht mehr heraus.
+    if text[1] - logo[3] < MIN_CORRIDOR:
+        return [(min(logo[0], text[0]), logo[1], max(logo[2], text[2]), text[3])]
+    return [logo, text]
+
+
+ZONE_PAD_NEAR = 46    # Abstand fuer die vorderen Ebenen
+ZONE_PAD_FAR = 18     # Abstand fuer die hinterste Ebene
+MIN_CORRIDOR = 120    # darunter lohnt sich der Spalt zwischen Logo und Text nicht
 
 
 # ------------------------------------------------------------------ Helfer
@@ -90,6 +122,10 @@ def die(msg: str) -> None:
 
 def norm_name(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
 
 
 def svg_aspect(path: str) -> float:
@@ -280,8 +316,8 @@ def poisson_points(x0, y0, x1, y1, radius, zones, rng, tries=30):
     return pts
 
 
-def relax(boxes: list[list[float]], zones, iterations: int = 400,
-          gap: float = 13.0) -> None:
+def relax(boxes: list[list[float]], zones_for, iterations: int = 400,
+          gap: float = GAP) -> None:
     """
     Schiebt die Logo-Boxen [cx, cy, w, h] auseinander, bis sie sich weder
     gegenseitig noch die reservierten Zonen ueberlappen und alle im Bild
@@ -313,7 +349,7 @@ def relax(boxes: list[list[float]], zones, iterations: int = 400,
                 cxi, cyi = boxes[i][0], boxes[i][1]
 
         # Aus den reservierten Zonen herausschieben
-        for b in boxes:
+        for b, zones in zip(boxes, zones_for):
             for zx0, zy0, zx1, zy1 in zones:
                 x0, y0 = b[0] - b[2] / 2, b[1] - b[3] / 2
                 x1, y1 = b[0] + b[2] / 2, b[1] + b[3] / 2
@@ -334,7 +370,7 @@ def relax(boxes: list[list[float]], zones, iterations: int = 400,
             break
 
 
-def violations(boxes: list[list[float]], zones, gap: float = 13.0) -> list[int]:
+def violations(boxes: list[list[float]], zones_for, gap: float = GAP) -> list[int]:
     """Indizes aller Boxen, die noch ueberlappen oder aus dem Bild ragen."""
     bad: set[int] = set()
     n = len(boxes)
@@ -343,7 +379,7 @@ def violations(boxes: list[list[float]], zones, gap: float = 13.0) -> list[int]:
         x0, y0, x1, y1 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
         if x0 < EDGE - 0.5 or y0 < EDGE - 0.5 or x1 > W - EDGE + 0.5 or y1 > H - EDGE + 0.5:
             bad.add(i)
-        for zx0, zy0, zx1, zy1 in zones:
+        for zx0, zy0, zx1, zy1 in zones_for[i]:
             if x0 < zx1 and x1 > zx0 and y0 < zy1 and y1 > zy0:
                 bad.add(i)
         for j in range(i + 1, n):
@@ -355,21 +391,21 @@ def violations(boxes: list[list[float]], zones, gap: float = 13.0) -> list[int]:
     return sorted(bad)
 
 
-def settle(boxes: list[list[float]], zones) -> None:
+def settle(boxes: list[list[float]], zones_for) -> None:
     """
     Relaxation bis alles sitzt. Boxen, die auch danach noch anecken, werden
     schrittweise verkleinert -- lieber ein etwas kleineres Logo als eines,
     das den Text oder das BWTV-Logo anschneidet.
     """
-    for _ in range(20):
-        relax(boxes, zones)
-        bad = violations(boxes, zones)
+    for _ in range(40):
+        relax(boxes, zones_for)
+        bad = violations(boxes, zones_for)
         if not bad:
             return
         for i in bad:
             boxes[i][2] *= 0.94
             boxes[i][3] *= 0.94
-    if violations(boxes, zones):
+    if violations(boxes, zones_for):
         die("Scatter-Layout konnte nicht ueberlappungsfrei aufgeloest werden.")
 
 
@@ -378,12 +414,9 @@ def build_layout(logos: list[Logo], rng: random.Random) -> list[dict]:
     n = len(logos)
     margin = 70
     box = (margin, margin, W - margin, H - margin)
-    zones = reserved_zones()
-    # Beim Sampling die Zonen leicht aufblasen, damit die Startpunkte nicht
-    # direkt an der Kante kleben; den Rest erledigt die Relaxation.
-    pad = 42
-    sample_zones = [(x0 - pad, y0 - pad, x1 + pad, y1 + pad)
-                    for x0, y0, x1, y1 in zones]
+    # Gesampelt wird gegen die engen Boxen, damit auch direkt neben Logo und
+    # Text Punkte entstehen -- dort landen spaeter die hintersten Ebenen.
+    sample_zones = reserved_zones(ZONE_PAD_FAR + 18)
 
     # Radius so waehlen, dass knapp mehr Punkte als Logos entstehen.
     best = None
@@ -416,22 +449,38 @@ def build_layout(logos: list[Logo], rng: random.Random) -> list[dict]:
 
     rng.shuffle(pts)
 
-    # Groesse: gleiche optische Flaeche pro Logo, begrenzt durch den Abstand
-    # zum naechsten Nachbarn (keine Ueberlappungen) sowie durch Bildrand und
-    # reservierte Zonen (kein Anschneiden, kein Ueberlappen von Logo/Text).
-    target_area = 11_600.0
+    # Tiefe zuweisen. Punkte, die nah an Logo oder Text liegen, muessen in die
+    # hinterste Ebene -- dort sind sie so blass, dass sie nicht stoeren.
+    near_zones = reserved_zones(ZONE_PAD_NEAR)
+    tight = [any(zx0 < px < zx1 and zy0 < py < zy1
+                 for zx0, zy0, zx1, zy1 in near_zones) for px, py in pts]
+
+    far_slots = [i / max(1, n - 1) * DEPTH_NEAR for i in range(n)]
+    rest_slots = [DEPTH_NEAR + (1 - DEPTH_NEAR) * i / max(1, n - 1)
+                  for i in range(n)]
+    rng.shuffle(far_slots)
+    rng.shuffle(rest_slots)
+    depths = [far_slots.pop() if t else rest_slots.pop() for t in tight]
+
+    # Groesse: gleiche optische Flaeche pro Logo, skaliert mit der Tiefe,
+    # begrenzt durch Bildrand und reservierte Zonen.
+    target_area = 12_400.0
     boxes: list[list[float]] = []
-    for logo, (px, py) in zip(logos, pts):
+    for logo, (px, py), d in zip(logos, pts, depths):
         a = max(0.55, min(3.2, logo.aspect))
-        w = math.sqrt(target_area * a)
-        h = math.sqrt(target_area / a)
+        area = target_area * lerp(*DEPTH_SCALE, d) ** 2
+        w = math.sqrt(area * a)
+        h = math.sqrt(area / a)
         k = min(1.0, MAX_LOGO_W / w, MAX_LOGO_H / h)
         boxes.append([px, py, w * k, h * k])
 
-    settle(boxes, zones)
+    zones_for = [reserved_zones(ZONE_PAD_FAR if d < DEPTH_NEAR else ZONE_PAD_NEAR)
+                 for d in depths]
+    settle(boxes, zones_for)
 
     items: list[dict] = []
-    for logo, (cx, cy, w, h) in zip(logos, boxes):
+    for logo, (cx, cy, w, h), d in zip(logos, boxes, depths):
+        amp = lerp(*DEPTH_DRIFT, d)
         items.append({
             "name": logo.name,
             "src": data_uri(os.path.join(REPO, logo.file),
@@ -439,6 +488,20 @@ def build_layout(logos: list[Logo], rng: random.Random) -> list[dict]:
             "x": round(cx, 2), "y": round(cy, 2),
             "w": round(w, 2), "h": round(h, 2),
             "rot": round(rng.uniform(-7.0, 7.0), 2),
+            # Tiefenstaffelung
+            "op": round(lerp(*DEPTH_OPACITY, d), 4),
+            "blur": round(lerp(*DEPTH_BLUR, d), 2),
+            "z": int(round(d * 100)),
+            # Schweben: zwei entkoppelte Sinusse plus leichte Drehung
+            "ax": round(rng.uniform(*DRIFT_X) * amp, 2),
+            "ay": round(rng.uniform(*DRIFT_Y) * amp, 2),
+            "ar": round(rng.uniform(*DRIFT_ROT) * amp, 3),
+            "px": round(rng.uniform(*DRIFT_PERIOD), 3),
+            "py": round(rng.uniform(*DRIFT_PERIOD), 3),
+            "pr": round(rng.uniform(*DRIFT_PERIOD), 3),
+            "fx": round(rng.uniform(0, 2 * math.pi), 4),
+            "fy": round(rng.uniform(0, 2 * math.pi), 4),
+            "fr": round(rng.uniform(0, 2 * math.pi), 4),
             # Minimaler Stagger: alle Starts innerhalb von T_LOGOS_SPREAD,
             # damit die Logos praktisch "auf einmal" reinknallen.
             "t0": round(T_LOGOS_START + rng.uniform(0.0, T_LOGOS_SPREAD), 4),
@@ -454,14 +517,14 @@ HTML_TEMPLATE = """<!doctype html>
 <title>BWTV Liga 2026 Recap</title>
 <style>
   @font-face {{
-    font-family: 'Inter'; font-style: normal; font-weight: 100 900;
+    font-family: 'Source Sans 3'; font-style: normal; font-weight: 400 900;
     font-display: block; src: url({font_uri}) format('woff2');
   }}
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   html, body {{ width: {W}px; height: {H}px; overflow: hidden; background: #FFFFFF; }}
   #stage {{
     position: relative; width: {W}px; height: {H}px; background: #FFFFFF;
-    font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased;
+    font-family: 'Source Sans 3', sans-serif; -webkit-font-smoothing: antialiased;
   }}
 
   /* dark-logo Variante statt der grauen: Team-Logos rein schwarz.
@@ -476,15 +539,16 @@ HTML_TEMPLATE = """<!doctype html>
   }}
   .team img {{ width: 100%; height: 100%; object-fit: contain; display: block; }}
 
+
   #bwtv {{
     position: absolute; left: {bwtv_cx}px; top: {bwtv_cy}px;
     width: {bwtv_w}px; height: {bwtv_h}px;
-    transform: translate(-50%, -50%); z-index: 10;
+    transform: translate(-50%, -50%); z-index: 120;
   }}
   #bwtv img {{ width: 100%; height: 100%; object-fit: contain; display: block; }}
 
   #outro {{
-    position: absolute; left: 50%; top: {text_cy}px; z-index: 10;
+    position: absolute; left: 50%; top: {text_cy}px; z-index: 120;
     width: 100%; text-align: center; color: #000000;
     transform: translate(-50%, -50%) scale(0.72); opacity: 0;
     transform-origin: 50% 50%; will-change: transform, opacity;
@@ -527,8 +591,13 @@ const nodes = ITEMS.map(it => {{
   d.style.top    = (it.y - it.h / 2) + 'px';
   d.style.width  = it.w + 'px';
   d.style.height = it.h + 'px';
+  d.style.zIndex = String(it.z);
   const img = document.createElement('img');
   img.className = 'logo-black';
+  /* Tiefenunschaerfe: hintere Ebenen leicht weich, vordere knackscharf */
+  if (it.blur > 0.01) {{
+    img.style.filter = 'url(#logo-black-filter) blur(' + it.blur + 'px)';
+  }}
   img.src = it.src;
   img.alt = it.name;
   d.appendChild(img);
@@ -554,13 +623,25 @@ function backOut(x) {{
   return 1 + c3 * t * t * t + c1 * t * t;
 }}
 
+const TAU = Math.PI * 2;
+
 window.__setT = function (t) {{
   for (let i = 0; i < ITEMS.length; i++) {{
     const it = ITEMS[i];
     const p = clamp01((t - it.t0) / it.dur);
     const s = elasticOut(p);
-    nodes[i].style.opacity = String(p <= 0 ? 0 : clamp01(p / 0.12));
-    nodes[i].style.transform = 'rotate(' + it.rot + 'deg) scale(' + s.toFixed(5) + ')';
+
+    /* Schweben: zwei entkoppelte Sinusse mit unterschiedlichen Perioden,
+       dazu eine langsame Drehung. Laeuft durchgehend, auch waehrend des
+       Pops -- die Logos landen also in eine bereits treibende Wolke. */
+    const dx = it.ax * Math.sin(TAU * t / it.px + it.fx);
+    const dy = it.ay * Math.sin(TAU * t / it.py + it.fy);
+    const dr = it.ar * Math.sin(TAU * t / it.pr + it.fr);
+
+    nodes[i].style.opacity = String(p <= 0 ? 0 : it.op * clamp01(p / 0.12));
+    nodes[i].style.transform =
+      'translate(' + dx.toFixed(3) + 'px,' + dy.toFixed(3) + 'px) ' +
+      'rotate(' + (it.rot + dr).toFixed(4) + 'deg) scale(' + s.toFixed(5) + ')';
   }}
   const tp = clamp01((t - CFG.textStart) / CFG.textDur);
   const ts = 0.72 + 0.28 * backOut(tp);
@@ -585,7 +666,7 @@ def write_html(items: list[dict]) -> str:
     bwtv_h = BWTV_W / bwtv_aspect()
     html = HTML_TEMPLATE.format(
         W=W, H=H,
-        font_uri=data_uri(os.path.join(HERE, "assets", "Inter-latin-var.woff2")),
+        font_uri=data_uri(os.path.join(HERE, "assets", "SourceSans3-latin-var.woff2")),
         bwtv_uri=data_uri(os.path.join(REPO, BWTV_LOGO)),
         bwtv_cx=BWTV_CX, bwtv_cy=BWTV_CY,
         bwtv_w=round(BWTV_W, 2), bwtv_h=round(bwtv_h, 2),
