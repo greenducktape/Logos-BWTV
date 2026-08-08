@@ -514,17 +514,74 @@ def build_layout(logos: list[Logo], rng: random.Random) -> list[dict]:
 
 HTML_TEMPLATE = """<!doctype html>
 <html lang="de"><head><meta charset="utf-8">
-<title>BWTV Liga 2026 Recap</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BWTV Liga 2026 — Recap</title>
 <style>
   @font-face {{
     font-family: 'Source Sans 3'; font-style: normal; font-weight: 400 900;
     font-display: block; src: url({font_uri}) format('woff2');
   }}
+
+  /* Die Buehne ist immer weiss -- das ist der Bildgrund des Videos und kein
+     Theme-Token. Nur die Huelle drumherum folgt dem Theme des Betrachters. */
+  :root {{
+    --ground: #E4E9ED;
+    --ground-edge: #D2DAE0;
+    --ink: #1B2429;
+    --ink-quiet: #5C6B75;
+    --line: #C3CDD5;
+    --accent: #00ADEB;
+    --focus: #F18D5A;
+    --shadow: 0 2px 6px rgba(17, 32, 41, .07), 0 18px 48px rgba(17, 32, 41, .16);
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root:not([data-theme="light"]) {{
+      --ground: #0E1418;
+      --ground-edge: #070B0E;
+      --ink: #E6EDF2;
+      --ink-quiet: #8B9BA6;
+      --line: #26323A;
+      --accent: #4EC5F5;
+      --shadow: 0 2px 6px rgba(0, 0, 0, .5), 0 18px 56px rgba(0, 0, 0, .65);
+    }}
+  }}
+  :root[data-theme="dark"] {{
+    --ground: #0E1418;
+    --ground-edge: #070B0E;
+    --ink: #E6EDF2;
+    --ink-quiet: #8B9BA6;
+    --line: #26323A;
+    --accent: #4EC5F5;
+    --shadow: 0 2px 6px rgba(0, 0, 0, .5), 0 18px 56px rgba(0, 0, 0, .65);
+  }}
+
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  html, body {{ width: {W}px; height: {H}px; overflow: hidden; background: #FFFFFF; }}
+  html, body {{ height: 100%; }}
+  body {{
+    background: var(--ground); color: var(--ink);
+    font-family: 'Source Sans 3', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+  }}
+
+  #page {{
+    display: flex; flex-direction: column; align-items: center;
+    gap: 14px; padding: 16px;
+  }}
+
+  /* Der Rahmen bekommt die skalierte Groesse, die Buehne bleibt intern
+     immer exakt 1080x1920 -- so ist die Live-Ansicht pixelgleich zum Video. */
+  #frame {{
+    width: calc({W}px * var(--scale));
+    height: calc({H}px * var(--scale));
+    box-shadow: var(--shadow);
+    background: #FFFFFF;
+  }}
   #stage {{
     position: relative; width: {W}px; height: {H}px; background: #FFFFFF;
-    font-family: 'Source Sans 3', sans-serif; -webkit-font-smoothing: antialiased;
+    transform: scale(var(--scale)); transform-origin: 0 0;
+    font-family: 'Source Sans 3', sans-serif;
   }}
 
   /* dark-logo Variante statt der grauen: Team-Logos rein schwarz.
@@ -538,7 +595,6 @@ HTML_TEMPLATE = """<!doctype html>
     transform-origin: 50% 50%; opacity: 0;
   }}
   .team img {{ width: 100%; height: 100%; object-fit: contain; display: block; }}
-
 
   #bwtv {{
     position: absolute; left: {bwtv_cx}px; top: {bwtv_cy}px;
@@ -561,6 +617,31 @@ HTML_TEMPLATE = """<!doctype html>
     font-size: 138px; font-weight: 900; letter-spacing: 2px;
     line-height: 1.02; margin-top: 8px;
   }}
+
+  #ui {{
+    display: flex; align-items: baseline; gap: 16px;
+    width: calc({W}px * var(--scale)); min-width: 260px;
+  }}
+  #ui .label {{
+    flex: 1; font-size: 12px; font-weight: 600; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--ink-quiet);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }}
+  #replay {{
+    font: inherit; font-size: 13px; font-weight: 700; letter-spacing: .04em;
+    color: var(--ink); background: transparent;
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: 6px 15px; cursor: pointer;
+    transition: border-color .15s, color .15s;
+  }}
+  #replay:hover {{ border-color: var(--accent); color: var(--accent); }}
+  #replay:focus-visible {{ outline: 2px solid var(--focus); outline-offset: 3px; }}
+
+  /* Aufnahmemodus: die Buehne rendert unskaliert und allein im Bild. */
+  body.capture {{ background: #FFFFFF; overflow: visible; }}
+  body.capture #page {{ padding: 0; gap: 0; }}
+  body.capture #frame {{ box-shadow: none; }}
+  body.capture #ui {{ display: none; }}
 </style></head>
 <body>
 <svg width="0" height="0" aria-hidden="true" style="position:absolute"><defs>
@@ -574,16 +655,35 @@ HTML_TEMPLATE = """<!doctype html>
     <feComponentTransfer><feFuncA type="table" tableValues="0 0.55 0.88 1 1"/></feComponentTransfer>
   </filter>
 </defs></svg>
-<div id="stage">
-  <div id="teams"></div>
-  <div id="bwtv"><img src="{bwtv_uri}" alt="BWTV Liga"></div>
-  <div id="outro"><div class="l1">Wir sehen uns</div><div class="l2">2027</div></div>
+
+<div id="page">
+  <div id="frame">
+    <div id="stage">
+      <div id="teams"></div>
+      <div id="bwtv"><img src="{bwtv_uri}" alt="BWTV Triathlonliga"></div>
+      <div id="outro"><div class="l1">Wir sehen uns</div><div class="l2">2027</div></div>
+    </div>
+  </div>
+  <div id="ui">
+    <span class="label">BWTV Triathlonliga · Recap 2026</span>
+    <button id="replay" type="button">Nochmal abspielen</button>
+  </div>
 </div>
+
 <script>
+/* Alles gekapselt: nach aussen sichtbar sind nur __setT, __capture und
+   __ready. Sonst kollidieren Namen wie "frame" mit den globalen Aliassen,
+   die der Browser fuer Elemente mit id anlegt. */
+(function () {{
+'use strict';
+
 const ITEMS = {items_json};
 const CFG = {cfg_json};
 
+const stage = document.getElementById('stage');
 const teamsEl = document.getElementById('teams');
+const outro = document.getElementById('outro');
+
 const nodes = ITEMS.map(it => {{
   const d = document.createElement('div');
   d.className = 'team';
@@ -604,7 +704,6 @@ const nodes = ITEMS.map(it => {{
   teamsEl.appendChild(d);
   return d;
 }});
-const outro = document.getElementById('outro');
 
 const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
 
@@ -625,6 +724,9 @@ function backOut(x) {{
 
 const TAU = Math.PI * 2;
 
+/* Die einzige Quelle der Wahrheit fuer die Szene: setzt den Zustand fuer
+   einen beliebigen Zeitpunkt. Die Live-Wiedergabe ruft sie pro Bildschirm-
+   frame auf, der Video-Export pro Videoframe -- beides ergibt dasselbe Bild. */
 window.__setT = function (t) {{
   for (let i = 0; i < ITEMS.length; i++) {{
     const it = ITEMS[i];
@@ -649,6 +751,56 @@ window.__setT = function (t) {{
   outro.style.transform = 'translate(-50%, -50%) scale(' + ts.toFixed(5) + ')';
 }};
 
+/* Buehne auf den Viewport einpassen. Intern bleibt sie 1080x1920, skaliert
+   wird nur die Darstellung -- Layout und Animation sind aufloesungsunabhaengig. */
+function fit() {{
+  if (document.body.classList.contains('capture')) return;
+  const pad = 32, ui = 56;
+  const s = Math.min((window.innerWidth - pad) / {W},
+                     (window.innerHeight - pad - ui) / {H});
+  document.documentElement.style.setProperty('--scale', Math.max(s, 0.05).toFixed(5));
+}}
+window.addEventListener('resize', fit);
+fit();
+
+/* Wiedergabe in Echtzeit. Der Ausklang laeuft endlos weiter -- die Logos
+   schweben also auch nach dem Ende der 7 Sekunden. */
+let raf = null, t0 = 0;
+
+function tick(now) {{
+  window.__setT((now - t0) / 1000);
+  raf = requestAnimationFrame(tick);
+}}
+
+function play() {{
+  if (raf !== null) cancelAnimationFrame(raf);
+  t0 = performance.now();
+  raf = requestAnimationFrame(tick);
+}}
+
+/* Bei reduzierter Bewegung nichts animieren: direkt das Endbild zeigen. */
+const calm = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+function start() {{
+  if (calm.matches) {{
+    if (raf !== null) {{ cancelAnimationFrame(raf); raf = null; }}
+    window.__setT(CFG.duration);
+  }} else {{
+    play();
+  }}
+}}
+
+document.getElementById('replay').addEventListener('click', start);
+calm.addEventListener('change', start);
+
+/* Frame-genauer Export: Animation anhalten, unskaliert rendern, Chrome weg.
+   Der Renderer setzt danach jeden Zeitpunkt selbst ueber __setT(). */
+window.__capture = function () {{
+  if (raf !== null) {{ cancelAnimationFrame(raf); raf = null; }}
+  document.body.classList.add('capture');
+  document.documentElement.style.setProperty('--scale', '1');
+}};
+
 window.__ready = (async () => {{
   const imgs = Array.from(document.images);
   await Promise.all(imgs.map(im => im.complete && im.naturalWidth
@@ -656,7 +808,10 @@ window.__ready = (async () => {{
     : new Promise(res => {{ im.onload = res; im.onerror = res; }})));
   await document.fonts.ready;
   window.__setT(0);
+  fit();
+  start();
   return true;
+}})();
 }})();
 </script></body></html>
 """
@@ -672,12 +827,27 @@ def write_html(items: list[dict]) -> str:
         bwtv_w=round(BWTV_W, 2), bwtv_h=round(bwtv_h, 2),
         text_cy=TEXT_CY,
         items_json=json.dumps(items, ensure_ascii=False),
-        cfg_json=json.dumps({"textStart": T_TEXT_START, "textDur": T_TEXT_DUR}),
+        cfg_json=json.dumps({
+            "textStart": T_TEXT_START, "textDur": T_TEXT_DUR,
+            "duration": DURATION,
+        }),
     )
-    out = os.path.join(BUILD, "recap.html")
+    out = os.path.join(HERE, "bwtv_recap_2026.html")
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(html)
+
+    # Variante fuer Hosts, die das Dokumentgeruest selbst mitbringen
+    # (z.B. Artifacts): nur Stylesheet und Body-Inhalt, ohne <html>/<head>.
+    with open(os.path.join(BUILD, "artifact.html"), "w", encoding="utf-8") as fh:
+        fh.write(to_fragment(html))
     return out
+
+
+def to_fragment(html: str) -> str:
+    """Stylesheet + Body-Inhalt aus dem fertigen Dokument herausloesen."""
+    css = html[html.index("<style>"):html.index("</style></head>") + len("</style>")]
+    body = html[html.index("<body>") + len("<body>"):html.index("</body></html>")]
+    return f"<title>BWTV Liga 2026 — Recap</title>\n{css}\n{body}"
 
 
 # ---------------------------------------------------------------- Rendering
@@ -723,20 +893,22 @@ def main() -> None:
     print(f"Team-Logos: {len(logos)}")
 
     items = build_layout(logos, rng)
+    with open(os.path.join(BUILD, "layout.json"), "w", encoding="utf-8") as fh:
+        json.dump([{k: v for k, v in it.items() if k != "src"} for it in items],
+                  fh, ensure_ascii=False, indent=2)
+
     html_path = write_html(items)
-    print(f"HTML: {html_path}")
+    print(f"HTML: {html_path} ({os.path.getsize(html_path) / 1e6:.1f} MB)")
+
+    if "--html-only" in sys.argv:
+        return
 
     render_frames(html_path)
     print(f"Frames: {N_FRAMES} @ {W}x{H}, {FPS} fps")
 
     out = os.path.join(HERE, "bwtv_recap_2026.mp4")
     encode(out)
-    size_mb = os.path.getsize(out) / 1e6
-    print(f"Fertig: {out} ({size_mb:.1f} MB, {DURATION:.1f}s)")
-
-    with open(os.path.join(BUILD, "layout.json"), "w", encoding="utf-8") as fh:
-        json.dump([{k: v for k, v in it.items() if k != "src"} for it in items],
-                  fh, ensure_ascii=False, indent=2)
+    print(f"Video: {out} ({os.path.getsize(out) / 1e6:.1f} MB, {DURATION:.1f}s)")
 
 
 if __name__ == "__main__":

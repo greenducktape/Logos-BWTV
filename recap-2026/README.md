@@ -2,7 +2,13 @@
 
 Gesamt-Recap für die BWTV Triathlonliga (kein Video pro Einzelliga).
 
-**Output:** `bwtv_recap_2026.mp4` — 1080x1920, 7,0 s, 30 fps, H.264 High / yuv420p
+**Output:**
+
+* `bwtv_recap_2026.html` — die Animation als eigenständige Seite. Läuft live im
+  Browser, passt sich der Fenstergröße an, hat einen Replay-Button und schwebt
+  nach den 7 Sekunden endlos weiter. Alles eingebettet, keine externen Dateien.
+* `bwtv_recap_2026.mp4` — dieselbe Szene als Video, 1080x1920, 7,0 s, 30 fps,
+  H.264 High / yuv420p. Wird aus genau dieser HTML gerendert.
 
 ## Szene
 
@@ -22,16 +28,26 @@ bewegungslos und deckend davor.
 ## Bauen
 
 ```bash
-python3 recap-2026/build_recap.py
+python3 recap-2026/build_recap.py              # HTML + Video
+python3 recap-2026/build_recap.py --html-only  # nur HTML, in Sekunden
 ```
 
 Voraussetzungen: `python3`, `node` mit global installiertem `playwright`
 (inkl. Chromium) und `ffmpeg` mit `libx264`.
 
-Ablauf: Layout in Python → `build/recap.html` → 210 Einzelframes über
-Playwright → `ffmpeg`. Die Szenenzeit wird pro Frame explizit über
-`window.__setT(t)` gesetzt statt CSS-Animationen in Echtzeit laufen zu lassen —
-dadurch ist jeder Frame exakt reproduzierbar.
+Ablauf: Layout in Python → `bwtv_recap_2026.html` → 210 Einzelframes über
+Playwright → `ffmpeg`.
+
+HTML und Video sind dieselbe Datei: `window.__setT(t)` setzt den kompletten
+Szenenzustand für einen beliebigen Zeitpunkt und ist die einzige Quelle der
+Wahrheit. Die Live-Wiedergabe ruft sie pro Bildschirmframe auf, der Export
+pro Videoframe — damit kann das Video nicht von der HTML abweichen, und der
+Export bleibt unabhängig von der Rendergeschwindigkeit exakt reproduzierbar.
+Vor dem Export ruft der Renderer `window.__capture()` auf: Wiedergabe anhalten,
+Skalierung auf 1, Bedienleiste ausblenden. Aufgenommen wird dann nur `#stage`.
+
+`build/artifact.html` ist dieselbe Seite ohne `<html>`/`<head>` — für Hosts,
+die das Dokumentgerüst selbst mitbringen.
 
 ## Assets
 

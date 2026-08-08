@@ -30,10 +30,16 @@ const N = parseInt(process.env.RECAP_N, 10);
   await page.goto('file://' + HTML, { waitUntil: 'load' });
   await page.evaluate(() => window.__ready);
 
+  // Die Seite spielt sich beim Laden selbst ab. Fuer den Export wird sie
+  // angehalten und unskaliert gestellt; danach setzt der Renderer jeden
+  // Zeitpunkt einzeln, damit die Frames unabhaengig vom Tempo exakt sind.
+  await page.evaluate(() => window.__capture());
+  const stage = page.locator('#stage');
+
   for (let i = 0; i < N; i++) {
     const t = i / FPS;
     await page.evaluate(t => window.__setT(t), t);
-    await page.screenshot({
+    await stage.screenshot({
       path: path.join(OUT, 'f' + String(i + 1).padStart(4, '0') + '.png'),
       animations: 'disabled',
     });
