@@ -1,0 +1,5 @@
+# Zwischenstände des Builds (HTML, Einzelframes, Layout-Dump)
+build/
+
+# Python
+__pycache__/

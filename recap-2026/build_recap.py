@@ -1,0 +1,662 @@
+#!/usr/bin/env python3
+"""
+BWTV Liga 2026 — Recap Video Build
+==================================
+
+Baut das 5s-Recap-Video (1080x1920, h264) aus den Team-Logos dieses Repos.
+
+Szene (eine durchgehende Szene, weisser Hintergrund):
+  0.0-0.5s  BWTV-Liga-Logo (Kontrast-Variante Black) zentriert, bereits sichtbar
+  0.5-1.0s  Team-Logos poppen simultan/minimal gestaffelt rein
+            (Scatter-Layout, elastic-out Scale 0 -> 1.1 -> 1.0)
+  1.0-1.5s  "WIR SEHEN UNS 2027" Pop-In (Scale + Fade)
+  1.5-5.0s  Standbild / Hold
+
+Pipeline:  Layout (Python) -> recap.html -> Playwright-Frames -> ffmpeg (h264)
+
+Aufruf:    python3 recap-2026/build_recap.py
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import math
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+from dataclasses import dataclass
+
+# ---------------------------------------------------------------- Konstanten
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+BUILD = os.path.join(HERE, "build")
+FRAMES = os.path.join(BUILD, "frames")
+
+W, H = 1080, 1920
+FPS = 30
+DURATION = 5.0
+N_FRAMES = int(round(DURATION * FPS))
+
+SEED = 20261  # fester Seed -> reproduzierbares Scatter-Layout
+
+# Timeline (Sekunden)
+T_LOGOS_START = 0.50   # erster Team-Logo-Pop
+T_LOGOS_SPREAD = 0.22  # Stagger-Fenster (alle Starts liegen darin)
+T_LOGOS_DUR = 0.46     # Dauer einer einzelnen Elastic-Pop-Animation
+T_TEXT_START = 1.00
+T_TEXT_DUR = 0.42
+
+# BWTV-Liga-Logo (Kontrast-Variante fuer weissen Hintergrund)
+BWTV_LOGO = "Logo BWTV Liga Black.svg"
+BWTV_W = 600           # Renderbreite in px
+BWTV_CX, BWTV_CY = 540, 780
+
+# Text-Block
+TEXT_CY = 1180
+
+# Team-Logos: Maximalgroesse und Mindestabstand zum Bildrand
+MAX_LOGO_W, MAX_LOGO_H = 172, 126
+EDGE = 26
+
+# Team-Logos, die zusaetzlich zur team-logos.json aufgenommen werden sollen.
+# (Auf der Platte liegt "TNB Malterdingen white.svg", das in der team-logos.json
+#  fehlt. Bewusst leer gelassen -- die JSON ist laut Briefing die Quelle.)
+EXTRA_LOGOS: list[str] = []
+
+# Reservierte Zonen (x0, y0, x1, y1) -- hier duerfen keine Team-Logos liegen.
+def reserved_zones() -> list[tuple[float, float, float, float]]:
+    bh = BWTV_W / bwtv_aspect()
+    return [
+        # BWTV-Logo + Luft
+        (BWTV_CX - BWTV_W / 2 - 55, BWTV_CY - bh / 2 - 55,
+         BWTV_CX + BWTV_W / 2 + 55, BWTV_CY + bh / 2 + 55),
+        # "WIR SEHEN UNS 2027" + Luft
+        (145, TEXT_CY - 148, 935, TEXT_CY + 148),
+    ]
+
+
+# ------------------------------------------------------------------ Helfer
+
+def die(msg: str) -> None:
+    print(f"FEHLER: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def norm_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def svg_aspect(path: str) -> float:
+    """Seitenverhaeltnis (w/h) aus viewBox oder width/height des SVG."""
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        head = fh.read(4000)
+    m = re.search(r'viewBox\s*=\s*"([\d.eE+\- ,]+)"', head)
+    if m:
+        parts = [float(v) for v in re.split(r"[ ,]+", m.group(1).strip()) if v]
+        if len(parts) == 4 and parts[2] > 0 and parts[3] > 0:
+            return parts[2] / parts[3]
+    mw = re.search(r'\bwidth\s*=\s*"([\d.]+)', head)
+    mh = re.search(r'\bheight\s*=\s*"([\d.]+)', head)
+    if mw and mh and float(mh.group(1)) > 0:
+        return float(mw.group(1)) / float(mh.group(1))
+    return 1.0
+
+
+_bwtv_aspect_cache: list[float] = []
+
+
+def bwtv_aspect() -> float:
+    if not _bwtv_aspect_cache:
+        _bwtv_aspect_cache.append(svg_aspect(os.path.join(REPO, BWTV_LOGO)))
+    return _bwtv_aspect_cache[0]
+
+
+MIMES = {".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2"}
+
+
+def data_uri(path: str, payload: bytes | None = None) -> str:
+    mime = MIMES[os.path.splitext(path)[1].lower()]
+    if payload is None:
+        with open(path, "rb") as fh:
+            payload = fh.read()
+    return f"data:{mime};base64," + base64.b64encode(payload).decode("ascii")
+
+
+# ----------------------------------------------------- Logos schwarz faerben
+
+# Reihenfolge wichtig: 6 Stellen vor 3 Stellen, sonst wird #rrggbb nach drei
+# Zeichen abgeschnitten. Der Lookahead verhindert Treffer in laengeren Werten.
+COLOR_RE = re.compile(
+    r'((?:fill|stroke|stop-color|flood-color|color)\s*[:=]\s*"?\s*)'
+    r'(#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})(?![0-9a-fA-F]))'
+)
+
+# Ab dieser Luminanz-Spanne gilt ein Logo als bewusst zweifarbig; die helle
+# Ebene bleibt dann als Aussparung stehen, statt mit der dunklen zu verschmelzen.
+DUOTONE_SPLIT = 0.40
+
+
+def _lum(hex_color: str) -> float:
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def blackify_svg(path: str) -> bytes:
+    """
+    Faerbt ein Team-Logo auf reines Schwarz/Weiss um.
+
+    Ein simples brightness(0) wuerde zweifarbige Logos (z.B. SV Ludwigsburg 08
+    gelb/schwarz oder SV Waiblingen blau/grau) zu unlesbaren Klecksen
+    verschmelzen. Darum:
+      - einfarbiges Logo            -> alles Schwarz
+      - Logo mit grossem Luminanz-  -> dunkle Ebene Schwarz, helle Ebene Weiss
+        Kontrast                       (Weiss = Aussparung auf weissem Grund)
+      - Logo mit geringem Kontrast  -> alles Schwarz
+
+    Weiss bleibt danach per Luminanz-Filter im HTML transparent, die
+    Antialiasing-Kanten rendert der Rasterizer sauber auf der schwarzen Form.
+    """
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        svg = fh.read()
+
+    colors = {m.group(2).lower() for m in COLOR_RE.finditer(svg)}
+    if not colors:
+        return svg.encode("utf-8")
+
+    lums = {c: _lum(c) for c in colors}
+    span = max(lums.values()) - min(lums.values())
+    if len(colors) > 1 and span > DUOTONE_SPLIT:
+        cut = (max(lums.values()) + min(lums.values())) / 2
+        mapping = {c: ("#000000" if l < cut else "#ffffff") for c, l in lums.items()}
+    else:
+        mapping = {c: "#000000" for c in colors}
+
+    return COLOR_RE.sub(
+        lambda m: m.group(1) + mapping[m.group(2).lower()], svg
+    ).encode("utf-8")
+
+
+# ------------------------------------------------------------- Logo-Auflösung
+
+@dataclass
+class Logo:
+    name: str
+    file: str
+    aspect: float
+
+
+def load_logos() -> list[Logo]:
+    with open(os.path.join(HERE, "team-logos.json"), encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    on_disk = {f for f in os.listdir(REPO) if f.lower().endswith(".svg")}
+    by_norm = {norm_name(f): f for f in on_disk}
+
+    logos: list[Logo] = []
+    missing: list[str] = []
+    for team in data["teams"]:
+        want = urllib.parse.unquote(team["file"])
+        fname = want if want in on_disk else by_norm.get(norm_name(want))
+        if not fname:
+            missing.append(f'{team["name"]} -> {want}')
+            continue
+        logos.append(Logo(team["name"], fname,
+                          svg_aspect(os.path.join(REPO, fname))))
+
+    for fname in EXTRA_LOGOS:
+        if fname not in on_disk:
+            missing.append(f"EXTRA -> {fname}")
+            continue
+        logos.append(Logo(os.path.splitext(fname)[0], fname,
+                          svg_aspect(os.path.join(REPO, fname))))
+
+    if missing:
+        die("Logo-Dateien nicht gefunden:\n  " + "\n  ".join(missing))
+    return logos
+
+
+# ------------------------------------------------------------ Scatter-Layout
+
+def poisson_points(x0, y0, x1, y1, radius, zones, rng, tries=30):
+    """Bridson Poisson-Disk-Sampling -- organisch verstreut, ohne Ueberlappung."""
+    cell = radius / math.sqrt(2)
+    gw = max(1, int(math.ceil((x1 - x0) / cell)))
+    gh = max(1, int(math.ceil((y1 - y0) / cell)))
+    grid: list[int | None] = [None] * (gw * gh)
+    pts: list[tuple[float, float]] = []
+
+    def blocked(px, py):
+        return any(zx0 <= px <= zx1 and zy0 <= py <= zy1
+                   for zx0, zy0, zx1, zy1 in zones)
+
+    def fits(px, py):
+        if not (x0 <= px <= x1 and y0 <= py <= y1) or blocked(px, py):
+            return False
+        gx, gy = int((px - x0) / cell), int((py - y0) / cell)
+        for iy in range(max(0, gy - 2), min(gh, gy + 3)):
+            for ix in range(max(0, gx - 2), min(gw, gx + 3)):
+                idx = grid[iy * gw + ix]
+                if idx is not None:
+                    qx, qy = pts[idx]
+                    if (qx - px) ** 2 + (qy - py) ** 2 < radius * radius:
+                        return False
+        return True
+
+    def add(px, py):
+        pts.append((px, py))
+        grid[int((py - y0) / cell) * gw + int((px - x0) / cell)] = len(pts) - 1
+        return len(pts) - 1
+
+    # Startpunkt suchen (ausserhalb der reservierten Zonen)
+    for _ in range(4000):
+        px, py = rng.uniform(x0, x1), rng.uniform(y0, y1)
+        if not blocked(px, py):
+            active = [add(px, py)]
+            break
+    else:
+        return []
+
+    while active:
+        i = active[rng.randrange(len(active))]
+        ax, ay = pts[i]
+        for _ in range(tries):
+            ang = rng.uniform(0, 2 * math.pi)
+            rad = rng.uniform(radius, 2 * radius)
+            nx, ny = ax + math.cos(ang) * rad, ay + math.sin(ang) * rad
+            if fits(nx, ny):
+                active.append(add(nx, ny))
+                break
+        else:
+            active.remove(i)
+    return pts
+
+
+def relax(boxes: list[list[float]], zones, iterations: int = 400,
+          gap: float = 13.0) -> None:
+    """
+    Schiebt die Logo-Boxen [cx, cy, w, h] auseinander, bis sie sich weder
+    gegenseitig noch die reservierten Zonen ueberlappen und alle im Bild
+    liegen. Verschieben statt Verkleinern -- so bleiben die Logos gross und
+    fuellen die Flaeche gleichmaessig bis dicht an Logo und Text heran.
+    """
+    n = len(boxes)
+    for _ in range(iterations):
+        moved = 0.0
+
+        # Nachbarn auseinanderdruecken (Achse der geringsten Ueberlappung)
+        for i in range(n):
+            cxi, cyi, wi, hi = boxes[i]
+            for j in range(i + 1, n):
+                cxj, cyj, wj, hj = boxes[j]
+                ox = (wi + wj) / 2 + gap - abs(cxi - cxj)
+                oy = (hi + hj) / 2 + gap - abs(cyi - cyj)
+                if ox <= 0 or oy <= 0:
+                    continue
+                if ox < oy:
+                    d = ox / 2 * (1 if cxi >= cxj else -1)
+                    boxes[i][0] += d
+                    boxes[j][0] -= d
+                else:
+                    d = oy / 2 * (1 if cyi >= cyj else -1)
+                    boxes[i][1] += d
+                    boxes[j][1] -= d
+                moved += min(ox, oy)
+                cxi, cyi = boxes[i][0], boxes[i][1]
+
+        # Aus den reservierten Zonen herausschieben
+        for b in boxes:
+            for zx0, zy0, zx1, zy1 in zones:
+                x0, y0 = b[0] - b[2] / 2, b[1] - b[3] / 2
+                x1, y1 = b[0] + b[2] / 2, b[1] + b[3] / 2
+                if x0 >= zx1 or x1 <= zx0 or y0 >= zy1 or y1 <= zy0:
+                    continue
+                push = min((zx1 - x0, 0, 1), (x1 - zx0, 0, -1),
+                           (zy1 - y0, 1, 1), (y1 - zy0, 1, -1))
+                dist, axis, sign = push
+                b[axis] += dist * sign
+                moved += dist
+
+        # Im Bild halten
+        for b in boxes:
+            b[0] = min(max(b[0], EDGE + b[2] / 2), W - EDGE - b[2] / 2)
+            b[1] = min(max(b[1], EDGE + b[3] / 2), H - EDGE - b[3] / 2)
+
+        if moved < 0.5:
+            break
+
+
+def violations(boxes: list[list[float]], zones, gap: float = 13.0) -> list[int]:
+    """Indizes aller Boxen, die noch ueberlappen oder aus dem Bild ragen."""
+    bad: set[int] = set()
+    n = len(boxes)
+    for i in range(n):
+        cx, cy, w, h = boxes[i]
+        x0, y0, x1, y1 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+        if x0 < EDGE - 0.5 or y0 < EDGE - 0.5 or x1 > W - EDGE + 0.5 or y1 > H - EDGE + 0.5:
+            bad.add(i)
+        for zx0, zy0, zx1, zy1 in zones:
+            if x0 < zx1 and x1 > zx0 and y0 < zy1 and y1 > zy0:
+                bad.add(i)
+        for j in range(i + 1, n):
+            cxj, cyj, wj, hj = boxes[j]
+            if (abs(cx - cxj) < (w + wj) / 2 + gap * 0.5
+                    and abs(cy - cyj) < (h + hj) / 2 + gap * 0.5):
+                bad.add(i)
+                bad.add(j)
+    return sorted(bad)
+
+
+def settle(boxes: list[list[float]], zones) -> None:
+    """
+    Relaxation bis alles sitzt. Boxen, die auch danach noch anecken, werden
+    schrittweise verkleinert -- lieber ein etwas kleineres Logo als eines,
+    das den Text oder das BWTV-Logo anschneidet.
+    """
+    for _ in range(20):
+        relax(boxes, zones)
+        bad = violations(boxes, zones)
+        if not bad:
+            return
+        for i in bad:
+            boxes[i][2] *= 0.94
+            boxes[i][3] *= 0.94
+    if violations(boxes, zones):
+        die("Scatter-Layout konnte nicht ueberlappungsfrei aufgeloest werden.")
+
+
+def build_layout(logos: list[Logo], rng: random.Random) -> list[dict]:
+    """Scatter-Positionen + Groessen fuer alle Team-Logos."""
+    n = len(logos)
+    margin = 70
+    box = (margin, margin, W - margin, H - margin)
+    zones = reserved_zones()
+    # Beim Sampling die Zonen leicht aufblasen, damit die Startpunkte nicht
+    # direkt an der Kante kleben; den Rest erledigt die Relaxation.
+    pad = 42
+    sample_zones = [(x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+                    for x0, y0, x1, y1 in zones]
+
+    # Radius so waehlen, dass knapp mehr Punkte als Logos entstehen.
+    best = None
+    lo, hi = 90.0, 240.0
+    for _ in range(26):
+        r = (lo + hi) / 2
+        pts = poisson_points(*box, r, sample_zones, random.Random(SEED))
+        if len(pts) >= n:
+            best = (r, pts)
+            lo = r          # groesserer Radius = luftiger, solange es reicht
+        else:
+            hi = r
+        if hi - lo < 1.0:
+            break
+    if not best:
+        die("Scatter-Layout: zu wenig Platz fuer alle Team-Logos.")
+    pts = best[1]
+
+    # Ueberzaehlige Punkte entfernen: immer den, der seinem naechsten
+    # Nachbarn am naechsten ist -> die Verteilung bleibt gleichmaessig.
+    pts = list(pts)
+    while len(pts) > n:
+        worst_i, worst_d = 0, float("inf")
+        for i, (px, py) in enumerate(pts):
+            d = min(((qx - px) ** 2 + (qy - py) ** 2)
+                    for j, (qx, qy) in enumerate(pts) if j != i)
+            if d < worst_d:
+                worst_i, worst_d = i, d
+        pts.pop(worst_i)
+
+    rng.shuffle(pts)
+
+    # Groesse: gleiche optische Flaeche pro Logo, begrenzt durch den Abstand
+    # zum naechsten Nachbarn (keine Ueberlappungen) sowie durch Bildrand und
+    # reservierte Zonen (kein Anschneiden, kein Ueberlappen von Logo/Text).
+    target_area = 11_600.0
+    boxes: list[list[float]] = []
+    for logo, (px, py) in zip(logos, pts):
+        a = max(0.55, min(3.2, logo.aspect))
+        w = math.sqrt(target_area * a)
+        h = math.sqrt(target_area / a)
+        k = min(1.0, MAX_LOGO_W / w, MAX_LOGO_H / h)
+        boxes.append([px, py, w * k, h * k])
+
+    settle(boxes, zones)
+
+    items: list[dict] = []
+    for logo, (cx, cy, w, h) in zip(logos, boxes):
+        items.append({
+            "name": logo.name,
+            "src": data_uri(os.path.join(REPO, logo.file),
+                            blackify_svg(os.path.join(REPO, logo.file))),
+            "x": round(cx, 2), "y": round(cy, 2),
+            "w": round(w, 2), "h": round(h, 2),
+            "rot": round(rng.uniform(-7.0, 7.0), 2),
+            # Minimaler Stagger: alle Starts innerhalb von T_LOGOS_SPREAD,
+            # damit die Logos praktisch "auf einmal" reinknallen.
+            "t0": round(T_LOGOS_START + rng.uniform(0.0, T_LOGOS_SPREAD), 4),
+            "dur": T_LOGOS_DUR,
+        })
+    return items
+
+
+# --------------------------------------------------------------------- HTML
+
+HTML_TEMPLATE = """<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<title>BWTV Liga 2026 Recap</title>
+<style>
+  @font-face {{
+    font-family: 'Inter'; font-style: normal; font-weight: 100 900;
+    font-display: block; src: url({font_uri}) format('woff2');
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  html, body {{ width: {W}px; height: {H}px; overflow: hidden; background: #FFFFFF; }}
+  #stage {{
+    position: relative; width: {W}px; height: {H}px; background: #FFFFFF;
+    font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased;
+  }}
+
+  /* dark-logo Variante statt der grauen: Team-Logos rein schwarz.
+     Die SVGs sind beim Build schon auf Schwarz/Weiss reduziert; der Filter
+     macht daraus Deckkraft (schwarz = deckend, weiss = Aussparung) und faengt
+     zugleich das eine Logo mit eingebettetem Pixelbild mit ab. */
+  .logo-black {{ filter: url(#logo-black-filter); }}
+
+  .team {{
+    position: absolute; will-change: transform, opacity;
+    transform-origin: 50% 50%; opacity: 0;
+  }}
+  .team img {{ width: 100%; height: 100%; object-fit: contain; display: block; }}
+
+  #bwtv {{
+    position: absolute; left: {bwtv_cx}px; top: {bwtv_cy}px;
+    width: {bwtv_w}px; height: {bwtv_h}px;
+    transform: translate(-50%, -50%); z-index: 10;
+  }}
+  #bwtv img {{ width: 100%; height: 100%; object-fit: contain; display: block; }}
+
+  #outro {{
+    position: absolute; left: 50%; top: {text_cy}px; z-index: 10;
+    width: 100%; text-align: center; color: #000000;
+    transform: translate(-50%, -50%) scale(0.72); opacity: 0;
+    transform-origin: 50% 50%; will-change: transform, opacity;
+  }}
+  #outro .l1 {{
+    font-size: 76px; font-weight: 800; letter-spacing: 6px;
+    line-height: 1.05; text-transform: uppercase;
+  }}
+  #outro .l2 {{
+    font-size: 138px; font-weight: 900; letter-spacing: 2px;
+    line-height: 1.02; margin-top: 8px;
+  }}
+</style></head>
+<body>
+<svg width="0" height="0" aria-hidden="true" style="position:absolute"><defs>
+  <filter id="logo-black-filter" color-interpolation-filters="sRGB"
+          x="-4%" y="-4%" width="108%" height="108%">
+    <!-- RGB auf Schwarz, Alpha = Alpha - Luminanz -->
+    <feColorMatrix type="matrix" values="0 0 0 0 0
+                                         0 0 0 0 0
+                                         0 0 0 0 0
+                                         -0.299 -0.587 -0.114 1 0"/>
+    <feComponentTransfer><feFuncA type="table" tableValues="0 0.55 0.88 1 1"/></feComponentTransfer>
+  </filter>
+</defs></svg>
+<div id="stage">
+  <div id="teams"></div>
+  <div id="bwtv"><img src="{bwtv_uri}" alt="BWTV Liga"></div>
+  <div id="outro"><div class="l1">Wir sehen uns</div><div class="l2">2027</div></div>
+</div>
+<script>
+const ITEMS = {items_json};
+const CFG = {cfg_json};
+
+const teamsEl = document.getElementById('teams');
+const nodes = ITEMS.map(it => {{
+  const d = document.createElement('div');
+  d.className = 'team';
+  d.style.left   = (it.x - it.w / 2) + 'px';
+  d.style.top    = (it.y - it.h / 2) + 'px';
+  d.style.width  = it.w + 'px';
+  d.style.height = it.h + 'px';
+  const img = document.createElement('img');
+  img.className = 'logo-black';
+  img.src = it.src;
+  img.alt = it.name;
+  d.appendChild(img);
+  teamsEl.appendChild(d);
+  return d;
+}});
+const outro = document.getElementById('outro');
+
+const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+
+/* elastic-out: 0 -> 1.1 (Peak bei ~34%) -> 1.0 */
+function elasticOut(x) {{
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  return 1 - Math.pow(2, -10 * x) * Math.cos(x * 9.4);
+}}
+
+/* back-out mit ~18% Overshoot -> Text-Pop 0.72 -> 1.05 -> 1.0 */
+function backOut(x) {{
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const c1 = 2.4, c3 = c1 + 1, t = x - 1;
+  return 1 + c3 * t * t * t + c1 * t * t;
+}}
+
+window.__setT = function (t) {{
+  for (let i = 0; i < ITEMS.length; i++) {{
+    const it = ITEMS[i];
+    const p = clamp01((t - it.t0) / it.dur);
+    const s = elasticOut(p);
+    nodes[i].style.opacity = String(p <= 0 ? 0 : clamp01(p / 0.12));
+    nodes[i].style.transform = 'rotate(' + it.rot + 'deg) scale(' + s.toFixed(5) + ')';
+  }}
+  const tp = clamp01((t - CFG.textStart) / CFG.textDur);
+  const ts = 0.72 + 0.28 * backOut(tp);
+  outro.style.opacity = String(tp <= 0 ? 0 : clamp01(tp / 0.35));
+  outro.style.transform = 'translate(-50%, -50%) scale(' + ts.toFixed(5) + ')';
+}};
+
+window.__ready = (async () => {{
+  const imgs = Array.from(document.images);
+  await Promise.all(imgs.map(im => im.complete && im.naturalWidth
+    ? null
+    : new Promise(res => {{ im.onload = res; im.onerror = res; }})));
+  await document.fonts.ready;
+  window.__setT(0);
+  return true;
+}})();
+</script></body></html>
+"""
+
+
+def write_html(items: list[dict]) -> str:
+    bwtv_h = BWTV_W / bwtv_aspect()
+    html = HTML_TEMPLATE.format(
+        W=W, H=H,
+        font_uri=data_uri(os.path.join(HERE, "assets", "Inter-latin-var.woff2")),
+        bwtv_uri=data_uri(os.path.join(REPO, BWTV_LOGO)),
+        bwtv_cx=BWTV_CX, bwtv_cy=BWTV_CY,
+        bwtv_w=round(BWTV_W, 2), bwtv_h=round(bwtv_h, 2),
+        text_cy=TEXT_CY,
+        items_json=json.dumps(items, ensure_ascii=False),
+        cfg_json=json.dumps({"textStart": T_TEXT_START, "textDur": T_TEXT_DUR}),
+    )
+    out = os.path.join(BUILD, "recap.html")
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    return out
+
+
+# ---------------------------------------------------------------- Rendering
+
+def render_frames(html_path: str) -> None:
+    if os.path.isdir(FRAMES):
+        shutil.rmtree(FRAMES)
+    os.makedirs(FRAMES)
+    env = dict(os.environ, RECAP_HTML=html_path, RECAP_FRAMES=FRAMES,
+               RECAP_W=str(W), RECAP_H=str(H), RECAP_FPS=str(FPS),
+               RECAP_N=str(N_FRAMES))
+    node_path = subprocess.run(["npm", "root", "-g"], capture_output=True,
+                               text=True, check=True).stdout.strip()
+    env["NODE_PATH"] = node_path
+    subprocess.run(["node", os.path.join(HERE, "render_frames.js")],
+                   env=env, check=True)
+    got = len([f for f in os.listdir(FRAMES) if f.endswith(".png")])
+    if got != N_FRAMES:
+        die(f"Nur {got} von {N_FRAMES} Frames gerendert.")
+
+
+def encode(out_path: str) -> None:
+    ffmpeg = shutil.which("ffmpeg") or die("ffmpeg nicht gefunden.")
+    subprocess.run([
+        ffmpeg, "-y", "-loglevel", "error",
+        "-framerate", str(FPS), "-i", os.path.join(FRAMES, "f%04d.png"),
+        "-c:v", "libx264", "-profile:v", "high", "-level", "4.0",
+        "-preset", "slow", "-crf", "17",
+        "-pix_fmt", "yuv420p", "-color_primaries", "bt709",
+        "-color_trc", "bt709", "-colorspace", "bt709",
+        "-movflags", "+faststart", "-r", str(FPS),
+        out_path,
+    ], check=True)
+
+
+# --------------------------------------------------------------------- Main
+
+def main() -> None:
+    os.makedirs(BUILD, exist_ok=True)
+    rng = random.Random(SEED)
+
+    logos = load_logos()
+    print(f"Team-Logos: {len(logos)}")
+
+    items = build_layout(logos, rng)
+    html_path = write_html(items)
+    print(f"HTML: {html_path}")
+
+    render_frames(html_path)
+    print(f"Frames: {N_FRAMES} @ {W}x{H}, {FPS} fps")
+
+    out = os.path.join(HERE, "bwtv_recap_2026.mp4")
+    encode(out)
+    size_mb = os.path.getsize(out) / 1e6
+    print(f"Fertig: {out} ({size_mb:.1f} MB, {DURATION:.1f}s)")
+
+    with open(os.path.join(BUILD, "layout.json"), "w", encoding="utf-8") as fh:
+        json.dump([{k: v for k, v in it.items() if k != "src"} for it in items],
+                  fh, ensure_ascii=False, indent=2)
+
+
+if __name__ == "__main__":
+    main()
