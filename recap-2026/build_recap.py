@@ -9,7 +9,7 @@ Szene (eine durchgehende Szene, weisser Hintergrund):
   0.0-0.5s  BWTV-Liga-Logo (Kontrast-Variante Black) zentriert, bereits sichtbar
   0.5-1.0s  Team-Logos poppen simultan/minimal gestaffelt rein
             (Scatter-Layout, elastic-out Scale 0 -> 1.1 -> 1.0)
-  1.0-1.5s  "WIR SEHEN UNS 2027" Pop-In (Scale + Fade)
+  1.0-1.5s  "Danke fuer 2026 / und wir sehen uns in / 2027" Pop-In
   1.5-7.0s  Ausklang -- die Team-Logos schweben in mehreren
             Tiefenebenen weiter wie Wolken, BWTV steht deckend davor
 
@@ -76,8 +76,10 @@ BWTV_LOGO = "Logo BWTV Liga Black.svg"
 BWTV_W = 600           # Renderbreite in px
 BWTV_CX, BWTV_CY = 540, 780
 
-# Text-Block
+# Text-Block ("Danke fuer 2026 / und wir sehen uns in / 2027")
 TEXT_CY = 1180
+TEXT_HALF_W = 315
+TEXT_HALF_H = 148
 
 # Team-Logos: Maximalgroesse und Mindestabstand zum Bildrand.
 # GAP ist so gewaehlt, dass auch zwei maximal gegeneinander driftende Nachbarn
@@ -98,7 +100,8 @@ def reserved_zones(pad: float) -> list[tuple[float, float, float, float]]:
     bh = BWTV_W / bwtv_aspect()
     logo = (BWTV_CX - BWTV_W / 2 - pad, BWTV_CY - bh / 2 - pad,
             BWTV_CX + BWTV_W / 2 + pad, BWTV_CY + bh / 2 + pad)
-    text = (170 - pad, TEXT_CY - 136 - pad, 910 + pad, TEXT_CY + 136 + pad)
+    text = (BWTV_CX - TEXT_HALF_W - pad, TEXT_CY - TEXT_HALF_H - pad,
+            BWTV_CX + TEXT_HALF_W + pad, TEXT_CY + TEXT_HALF_H + pad)
 
     # Bleibt zwischen Logo und Text nur ein schmaler Korridor, wird er
     # mitreserviert. Sonst rutschen dort Logos hinein, fuer die er zu eng ist,
@@ -610,12 +613,16 @@ HTML_TEMPLATE = """<!doctype html>
     transform-origin: 50% 50%; will-change: transform, opacity;
   }}
   #outro .l1 {{
-    font-size: 76px; font-weight: 800; letter-spacing: 6px;
-    line-height: 1.05; text-transform: uppercase;
+    font-size: 68px; font-weight: 800; letter-spacing: 5px;
+    line-height: 1.06; text-transform: uppercase;
   }}
   #outro .l2 {{
+    font-size: 46px; font-weight: 600; letter-spacing: 4px;
+    line-height: 1.1; text-transform: uppercase; margin-top: 10px;
+  }}
+  #outro .l3 {{
     font-size: 138px; font-weight: 900; letter-spacing: 2px;
-    line-height: 1.02; margin-top: 8px;
+    line-height: 1.02; margin-top: 6px;
   }}
 
   #ui {{
@@ -661,7 +668,11 @@ HTML_TEMPLATE = """<!doctype html>
     <div id="stage">
       <div id="teams"></div>
       <div id="bwtv"><img src="{bwtv_uri}" alt="BWTV Triathlonliga"></div>
-      <div id="outro"><div class="l1">Wir sehen uns</div><div class="l2">2027</div></div>
+      <div id="outro">
+        <div class="l1">Danke für 2026</div>
+        <div class="l2">und wir sehen uns in</div>
+        <div class="l3">2027</div>
+      </div>
     </div>
   </div>
   <div id="ui">

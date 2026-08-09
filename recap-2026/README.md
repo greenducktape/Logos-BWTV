@@ -18,7 +18,7 @@ Eine durchgehende Szene auf weißem Hintergrund:
 |---|---|
 | 0,0–0,5 s | BWTV-Liga-Logo (Kontrast-Variante `Logo BWTV Liga Black.svg`) zentriert, bereits sichtbar |
 | 0,5–1,0 s | Team-Logos poppen quasi gleichzeitig rein — Scatter-Layout, elastic-out Scale 0 → 1,1 → 1,0 |
-| 1,0–1,5 s | „WIR SEHEN UNS 2027" Pop-In (Scale + Fade, back-out 0,72 → 1,05 → 1,0) |
+| 1,0–1,5 s | „Danke für 2026 / und wir sehen uns in / 2027" Pop-In (Scale + Fade, back-out 0,72 → 1,05 → 1,0) |
 | 1,5–7,0 s | Ausklang — die Team-Logos schweben in mehreren Tiefenebenen weiter wie Wolken |
 
 Das Schweben läuft durchgehend, auch während des Pops: die Logos landen also
@@ -96,6 +96,16 @@ gegeneinander driftende Nachbarn nicht berühren.
 
 Logos, die dicht an BWTV-Logo oder Text liegen, landen zwangsweise in der
 hintersten Ebene — dort sind sie so blass, dass sie nichts stören.
+
+## Outro-Text
+
+Dreizeilig: „Danke für 2026" trägt den Dank, „und wir sehen uns in" ist bewusst
+die leiseste Zeile — der Satz läuft in die große Jahreszahl hinein, die dadurch
+Schlusspunkt und Satzende zugleich ist. Alle drei Zeilen poppen als ein Block.
+
+`TEXT_HALF_W` und `TEXT_HALF_H` sind die reservierte Zone um den Block; sie sind
+an den tatsächlich gemessenen Zeilen ausgerichtet (breiteste Zeile 571 px, Block
+279 px hoch). Wer den Text ändert, misst nach und zieht sie mit.
 
 ## Layout
 
